@@ -1,61 +1,97 @@
-import requests
-import time
-from datetime import datetime, timezone
+import sqlite3
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-BASE_URL = "https://cashclub.sbs/"
+# ==========================================
+# 1. DATABASE SETUP (Auto-creates SQLite file)
+# ==========================================
+def init_db():
+    conn = sqlite3.connect('channels.db')
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS channels
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE)''')
+    conn.commit()
+    conn.close()
 
-def run(script):
-    url = BASE_URL + script
+def add_channel_db(username):
+    conn = sqlite3.connect('channels.db')
+    c = conn.cursor()
     try:
-        r = requests.get(url, timeout=10)
-        print(f"{datetime.now(timezone.utc).isoformat()} | {script} | {r.status_code}")
-    except Exception as e:
-        print(f"{datetime.now(timezone.utc).isoformat()} | {script} | ERROR: {e}")
+        c.execute("INSERT INTO channels (username) VALUES (?)", (username,))
+        conn.commit()
+        success = True
+    except sqlite3.IntegrityError:
+        success = False
+    finally:
+        conn.close()
+    return success
 
-last_30 = None
-last_60 = None
-last_180 = None
-last_300 = None
-last_600 = None
+def get_channels():
+    conn = sqlite3.connect('channels.db')
+    c = conn.cursor()
+    c.execute("SELECT username FROM channels")
+    channels = [row[0] for row in c.fetchall()]
+    conn.close()
+    return channels
 
-while True:
-    now = time.time()
-    s30 = int(now // 30)
-    s60 = int(now // 60)
-    s180 = int(now // 180)
-    s300 = int(now // 300)
-    s600 = int(now // 600)
+# ==========================================
+# 2. BOT COMMAND HANDLERS
+# ==========================================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        "Hello! Welcome to the Telegram Broadcast Bot.\n\n"
+        "1. To add a channel:\n"
+        "/addchannel @your_channel_username\n\n"
+        "2. To broadcast a message to all channels:\n"
+        "/post Your message text here"
+    )
 
-    if s30 != last_30:
-        run("niyamitakelasa30sec.php")   # FIXED
-        last_30 = s30
+async def add_channel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if context.args:
+        channel = context.args[0]
+        if add_channel_db(channel):
+            await update.message.reply_text(f'✅ {channel} successfully added to database.')
+        else:
+            await update.message.reply_text(f'⚠️ {channel} is already in the database.')
+    else:
+        await update.message.reply_text('Please provide a channel username.\nExample: /addchannel @mychannel')
 
-    if s60 != last_60:
-        run("niyamitakelasa.php")
-        run("niyamitakelasa_aidudi.php")
-        run("niyamitakelasa_kemuru.php")
-        run("ktrx.php")
-        last_60 = s60
+async def post_to_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    bot = context.bot
+    channels = get_channels()
+    message = " ".join(context.args)
 
-    if s180 != last_180:
-        run("niyamitakelasa_drei.php")
-        run("niyamitakelasa_aidudi_drei.php")
-        run("niyamitakelasa_kemuru_drei.php")
-        run("ktrx3.php")
-        last_180 = s180
+    if not message:
+        await update.message.reply_text('Please write a message to post.\nExample: /post Hello World')
+        return
 
-    if s300 != last_300:
-        run("niyamitakelasa_funf.php")
-        run("niyamitakelasa_aidudi_funf.php")
-        run("niyamitakelasa_kemuru_funf.php")
-        run("ktrx5.php")
-        last_300 = s300
+    if not channels:
+        await update.message.reply_text('No channels found! Add a channel first using /addchannel.')
+        return
 
-    if s600 != last_600:
-        run("niyamitakelasa_zehn.php")
-        run("niyamitakelasa_aidudi_zehn.php")
-        run("niyamitakelasa_kemuru_zehn.php")
-        run("ktrx10.php")
-        last_600 = s600
+    for channel in channels:
+        try:
+            await bot.send_message(chat_id=channel, text=message)
+            await update.message.reply_text(f'✅ Post sent to {channel}')
+        except Exception as e:
+            await update.message.reply_text(f'❌ Failed to send post to {channel}: {e}')
 
-    time.sleep(0.2)
+# ==========================================
+# 3. MAIN EXECUTION
+# ==========================================
+if __name__ == '__main__':
+    # Initialize Database
+    init_db()
+    
+    # Replace "8956561820:AAEBsYWuucvkhiUkq9SkWyg72ud17T53ATQ" with your actual Bot Token from BotFather
+    BOT_TOKEN = "8956561820:AAEBsYWuucvkhiUkq9SkWyg72ud17T53ATQ"
+    
+    application = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    # Register Handlers
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("addchannel", add_channel))
+    application.add_handler(CommandHandler("post", post_to_all))
+
+    print("Bot is running successfully...")
+    application.run_polling()
