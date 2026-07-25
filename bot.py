@@ -2,11 +2,12 @@ import sqlite3
 import asyncio
 import logging
 from datetime import datetime
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatPermissions
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler,
-    ContextTypes, CallbackQueryHandler, filters, ConversationHandler
+    ContextTypes, CallbackQueryHandler, filters
 )
+from telegram.error import TelegramError
 
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -14,34 +15,46 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Conversation states
-WAITING_CHANNEL = 1
-WAITING_GROUP = 2
-WAITING_POST_TARGET = 3
+# ==========================================
+# ADMIN CONFIG
+# ==========================================
+ADMIN_ID = 6678848886  # শুধু এই ID বট কন্ট্রোল করতে পারবে
+
+def is_admin(update: Update) -> bool:
+    return update.effective_user.id == ADMIN_ID
+
+def admin_only(func):
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not is_admin(update):
+            await update.message.reply_text(
+                "❌  *A C C E S S   D E N I E D*\n━━━━━━━━━━━━━━━━━━━━━━━\n\n🚫  Unauthorized!",
+                parse_mode="Markdown"
+            )
+            return
+        return await func(update, context)
+    return wrapper
 
 # ==========================================
-# 1. DATABASE SETUP
+# DATABASE SETUP
 # ==========================================
 def init_db():
     conn = sqlite3.connect('channels.db')
     c = conn.cursor()
-
     c.execute('''CREATE TABLE IF NOT EXISTS channels
                  (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  username TEXT UNIQUE,
-                  type TEXT DEFAULT 'channel',
+                  chat_id TEXT UNIQUE,
+                  title TEXT,
                   added_at TEXT)''')
-
     c.execute('''CREATE TABLE IF NOT EXISTS groups
                  (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  username TEXT UNIQUE,
+                  chat_id TEXT UNIQUE,
+                  title TEXT,
                   added_at TEXT)''')
-
     c.execute('''CREATE TABLE IF NOT EXISTS source_channels
                  (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  username TEXT UNIQUE,
+                  chat_id TEXT UNIQUE,
+                  title TEXT,
                   added_at TEXT)''')
-
     c.execute('''CREATE TABLE IF NOT EXISTS scheduled_posts
                  (id INTEGER PRIMARY KEY AUTOINCREMENT,
                   message TEXT,
@@ -50,17 +63,16 @@ def init_db():
                   schedule_time TEXT,
                   target TEXT DEFAULT 'all',
                   sent INTEGER DEFAULT 0)''')
-
     conn.commit()
     conn.close()
 
-# --- Channel DB ---
-def add_channel_db(username):
+# --- Channels ---
+def add_channel_db(chat_id, title=""):
     conn = sqlite3.connect('channels.db')
     c = conn.cursor()
     try:
-        c.execute("INSERT INTO channels (username, added_at) VALUES (?, ?)",
-                  (username, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+        c.execute("INSERT INTO channels (chat_id, title, added_at) VALUES (?, ?, ?)",
+                  (str(chat_id), title, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
         conn.commit()
         return True
     except sqlite3.IntegrityError:
@@ -68,10 +80,10 @@ def add_channel_db(username):
     finally:
         conn.close()
 
-def remove_channel_db(username):
+def remove_channel_db(chat_id):
     conn = sqlite3.connect('channels.db')
     c = conn.cursor()
-    c.execute("DELETE FROM channels WHERE username=?", (username,))
+    c.execute("DELETE FROM channels WHERE chat_id=?", (str(chat_id),))
     affected = c.rowcount
     conn.commit()
     conn.close()
@@ -80,18 +92,18 @@ def remove_channel_db(username):
 def get_channels():
     conn = sqlite3.connect('channels.db')
     c = conn.cursor()
-    c.execute("SELECT username FROM channels")
-    result = [row[0] for row in c.fetchall()]
+    c.execute("SELECT chat_id, title FROM channels")
+    result = c.fetchall()
     conn.close()
     return result
 
-# --- Group DB ---
-def add_group_db(username):
+# --- Groups ---
+def add_group_db(chat_id, title=""):
     conn = sqlite3.connect('channels.db')
     c = conn.cursor()
     try:
-        c.execute("INSERT INTO groups (username, added_at) VALUES (?, ?)",
-                  (username, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+        c.execute("INSERT INTO groups (chat_id, title, added_at) VALUES (?, ?, ?)",
+                  (str(chat_id), title, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
         conn.commit()
         return True
     except sqlite3.IntegrityError:
@@ -99,10 +111,10 @@ def add_group_db(username):
     finally:
         conn.close()
 
-def remove_group_db(username):
+def remove_group_db(chat_id):
     conn = sqlite3.connect('channels.db')
     c = conn.cursor()
-    c.execute("DELETE FROM groups WHERE username=?", (username,))
+    c.execute("DELETE FROM groups WHERE chat_id=?", (str(chat_id),))
     affected = c.rowcount
     conn.commit()
     conn.close()
@@ -111,18 +123,18 @@ def remove_group_db(username):
 def get_groups():
     conn = sqlite3.connect('channels.db')
     c = conn.cursor()
-    c.execute("SELECT username FROM groups")
-    result = [row[0] for row in c.fetchall()]
+    c.execute("SELECT chat_id, title FROM groups")
+    result = c.fetchall()
     conn.close()
     return result
 
-# --- Source DB ---
-def add_source_db(username):
+# --- Sources ---
+def add_source_db(chat_id, title=""):
     conn = sqlite3.connect('channels.db')
     c = conn.cursor()
     try:
-        c.execute("INSERT INTO source_channels (username, added_at) VALUES (?, ?)",
-                  (username, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+        c.execute("INSERT INTO source_channels (chat_id, title, added_at) VALUES (?, ?, ?)",
+                  (str(chat_id), title, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
         conn.commit()
         return True
     except sqlite3.IntegrityError:
@@ -133,8 +145,8 @@ def add_source_db(username):
 def get_sources():
     conn = sqlite3.connect('channels.db')
     c = conn.cursor()
-    c.execute("SELECT username FROM source_channels")
-    result = [row[0] for row in c.fetchall()]
+    c.execute("SELECT chat_id, title FROM source_channels")
+    result = c.fetchall()
     conn.close()
     return result
 
@@ -169,485 +181,784 @@ def mark_scheduled_sent(post_id):
     conn.close()
 
 # ==========================================
-# 2. BROADCAST HELPER
+# BROADCAST HELPER
 # ==========================================
 async def broadcast(bot, targets, text=None, media_file_id=None, media_type=None):
     results = {"success": 0, "fail": 0}
-    for target in targets:
+    for chat_id in targets:
         try:
             if media_file_id and media_type == "photo":
-                await bot.send_photo(chat_id=target, photo=media_file_id, caption=text)
+                await bot.send_photo(chat_id=chat_id, photo=media_file_id, caption=text)
             elif media_file_id and media_type == "video":
-                await bot.send_video(chat_id=target, video=media_file_id, caption=text)
+                await bot.send_video(chat_id=chat_id, video=media_file_id, caption=text)
             elif media_file_id and media_type == "document":
-                await bot.send_document(chat_id=target, document=media_file_id, caption=text)
+                await bot.send_document(chat_id=chat_id, document=media_file_id, caption=text)
             elif media_file_id and media_type == "audio":
-                await bot.send_audio(chat_id=target, audio=media_file_id, caption=text)
+                await bot.send_audio(chat_id=chat_id, audio=media_file_id, caption=text)
             elif media_file_id and media_type == "animation":
-                await bot.send_animation(chat_id=target, animation=media_file_id, caption=text)
+                await bot.send_animation(chat_id=chat_id, animation=media_file_id, caption=text)
             elif text:
-                await bot.send_message(chat_id=target, text=text)
+                await bot.send_message(chat_id=chat_id, text=text)
             results["success"] += 1
             await asyncio.sleep(0.3)
         except Exception as e:
-            logger.error(f"Failed to send to {target}: {e}")
+            logger.error(f"Failed {chat_id}: {e}")
             results["fail"] += 1
     return results
 
 # ==========================================
-# 3. MAIN MENU
+# KEYBOARDS
 # ==========================================
 def main_menu_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📺 চ্যানেল ম্যানেজ", callback_data="menu_channels"),
-         InlineKeyboardButton("👥 গ্রুপ ম্যানেজ", callback_data="menu_groups")],
-        [InlineKeyboardButton("📡 সোর্স চ্যানেল", callback_data="menu_sources"),
-         InlineKeyboardButton("📤 পোস্ট করুন", callback_data="menu_post")],
-        [InlineKeyboardButton("⏰ শিডিউল পোস্ট", callback_data="menu_schedule"),
-         InlineKeyboardButton("ℹ️ হেল্প", callback_data="menu_help")]
+        [InlineKeyboardButton("━━━━━━━━━━━━━━━━━━━━", callback_data="noop")],
+        [InlineKeyboardButton("📺  C H A N N E L S", callback_data="menu_channels")],
+        [InlineKeyboardButton("👥  G R O U P S", callback_data="menu_groups")],
+        [InlineKeyboardButton("━━━━━━━━━━━━━━━━━━━━", callback_data="noop")],
+        [InlineKeyboardButton("📡  S O U R C E   C H A N N E L S", callback_data="menu_sources")],
+        [InlineKeyboardButton("━━━━━━━━━━━━━━━━━━━━", callback_data="noop")],
+        [InlineKeyboardButton("📤  B R O A D C A S T", callback_data="menu_post")],
+        [InlineKeyboardButton("⏰  S C H E D U L E   P O S T", callback_data="menu_schedule")],
+        [InlineKeyboardButton("━━━━━━━━━━━━━━━━━━━━", callback_data="noop")],
+        [InlineKeyboardButton("🛡️  A D M I N   P O W E R S", callback_data="menu_admin")],
+        [InlineKeyboardButton("━━━━━━━━━━━━━━━━━━━━", callback_data="noop")],
+        [InlineKeyboardButton("📖  H E L P", callback_data="menu_help")],
     ])
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🤖 *Broadcast Bot*\n\nনিচের মেনু থেকে যা করতে চান বেছে নিন:",
-        parse_mode="Markdown",
-        reply_markup=main_menu_keyboard()
-    )
-
-# ==========================================
-# 4. CHANNEL MANAGEMENT MENU
-# ==========================================
 def channel_manage_keyboard():
     channels = get_channels()
-    keyboard = []
-    for ch in channels:
-        keyboard.append([
-            InlineKeyboardButton(f"📺 {ch}", callback_data=f"ch_info_{ch}"),
-            InlineKeyboardButton("🗑️ Delete", callback_data=f"ch_del_{ch}")
-        ])
-    keyboard.append([InlineKeyboardButton("➕ নতুন চ্যানেল যোগ করুন", callback_data="ch_add")])
-    keyboard.append([InlineKeyboardButton("🔙 মেনুতে ফিরুন", callback_data="back_main")])
+    keyboard = [[InlineKeyboardButton("━━━━━━━━━━━━━━━━━━━━", callback_data="noop")]]
+    if channels:
+        for chat_id, title in channels:
+            label = title if title else chat_id
+            keyboard.append([
+                InlineKeyboardButton(f"📺  {label}", callback_data="noop"),
+                InlineKeyboardButton("🗑  REMOVE", callback_data=f"ch_del_{chat_id}")
+            ])
+    else:
+        keyboard.append([InlineKeyboardButton("❌  No channels added yet", callback_data="noop")])
+    keyboard.append([InlineKeyboardButton("━━━━━━━━━━━━━━━━━━━━", callback_data="noop")])
+    keyboard.append([InlineKeyboardButton("➕  A D D   C H A N N E L", callback_data="ch_add")])
+    keyboard.append([InlineKeyboardButton("━━━━━━━━━━━━━━━━━━━━", callback_data="noop")])
+    keyboard.append([InlineKeyboardButton("🔙  B A C K", callback_data="back_main")])
     return InlineKeyboardMarkup(keyboard)
 
 def group_manage_keyboard():
     groups = get_groups()
-    keyboard = []
-    for g in groups:
-        keyboard.append([
-            InlineKeyboardButton(f"👥 {g}", callback_data=f"gr_info_{g}"),
-            InlineKeyboardButton("🗑️ Delete", callback_data=f"gr_del_{g}")
-        ])
-    keyboard.append([InlineKeyboardButton("➕ নতুন গ্রুপ যোগ করুন", callback_data="gr_add")])
-    keyboard.append([InlineKeyboardButton("🔙 মেনুতে ফিরুন", callback_data="back_main")])
+    keyboard = [[InlineKeyboardButton("━━━━━━━━━━━━━━━━━━━━", callback_data="noop")]]
+    if groups:
+        for chat_id, title in groups:
+            label = title if title else chat_id
+            keyboard.append([
+                InlineKeyboardButton(f"👥  {label}", callback_data="noop"),
+                InlineKeyboardButton("🗑  REMOVE", callback_data=f"gr_del_{chat_id}")
+            ])
+    else:
+        keyboard.append([InlineKeyboardButton("❌  No groups added yet", callback_data="noop")])
+    keyboard.append([InlineKeyboardButton("━━━━━━━━━━━━━━━━━━━━", callback_data="noop")])
+    keyboard.append([InlineKeyboardButton("➕  A D D   G R O U P", callback_data="gr_add")])
+    keyboard.append([InlineKeyboardButton("━━━━━━━━━━━━━━━━━━━━", callback_data="noop")])
+    keyboard.append([InlineKeyboardButton("🔙  B A C K", callback_data="back_main")])
     return InlineKeyboardMarkup(keyboard)
 
 def post_target_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📺 শুধু চ্যানেলে", callback_data="post_channels"),
-         InlineKeyboardButton("👥 শুধু গ্রুপে", callback_data="post_groups")],
-        [InlineKeyboardButton("🌐 সব জায়গায় (চ্যানেল+গ্রুপ)", callback_data="post_all")],
-        [InlineKeyboardButton("🔙 মেনুতে ফিরুন", callback_data="back_main")]
+        [InlineKeyboardButton("━━━━━━━━━━━━━━━━━━━━", callback_data="noop")],
+        [InlineKeyboardButton("📺  CHANNELS ONLY", callback_data="post_channels")],
+        [InlineKeyboardButton("👥  GROUPS ONLY", callback_data="post_groups")],
+        [InlineKeyboardButton("🌐  ALL (CHANNELS + GROUPS)", callback_data="post_all")],
+        [InlineKeyboardButton("━━━━━━━━━━━━━━━━━━━━", callback_data="noop")],
+        [InlineKeyboardButton("🔙  B A C K", callback_data="back_main")],
+    ])
+
+def admin_power_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("━━━━━━━━━━━━━━━━━━━━", callback_data="noop")],
+        [InlineKeyboardButton("🔇  M U T E   U S E R", callback_data="admin_mute"),
+         InlineKeyboardButton("🔊  U N M U T E", callback_data="admin_unmute")],
+        [InlineKeyboardButton("🚫  B A N   U S E R", callback_data="admin_ban"),
+         InlineKeyboardButton("✅  U N B A N", callback_data="admin_unban")],
+        [InlineKeyboardButton("👢  K I C K   U S E R", callback_data="admin_kick")],
+        [InlineKeyboardButton("━━━━━━━━━━━━━━━━━━━━", callback_data="noop")],
+        [InlineKeyboardButton("📌  P I N   M S G", callback_data="admin_pin"),
+         InlineKeyboardButton("🗑  D E L   M S G", callback_data="admin_delete")],
+        [InlineKeyboardButton("━━━━━━━━━━━━━━━━━━━━", callback_data="noop")],
+        [InlineKeyboardButton("🔙  B A C K", callback_data="back_main")],
+    ])
+
+def back_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔙  B A C K   T O   M E N U", callback_data="back_main")]
     ])
 
 # ==========================================
-# 5. CALLBACK HANDLER (Main Router)
+# START
+# ==========================================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        await update.message.reply_text("❌  *ACCESS DENIED*\n\n🚫  Unauthorized!", parse_mode="Markdown")
+        return
+    channels = len(get_channels())
+    groups = len(get_groups())
+    sources = len(get_sources())
+    text = (
+        "🤖  *B R O A D C A S T   B O T*\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"📺  *Channels :*  `{channels}`\n"
+        f"👥  *Groups :*  `{groups}`\n"
+        f"📡  *Sources :*  `{sources}`\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "👇  *Select an option below*"
+    )
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=main_menu_keyboard())
+
+# ==========================================
+# GET ID COMMAND — যেকোনো গ্রুপে কাজ করে
+# ==========================================
+async def getid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    user = update.effective_user
+    text = (
+        "🆔  *C H A T   I N F O*\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"💬  *Chat Title :*  `{chat.title or 'N/A'}`\n"
+        f"🔢  *Chat ID :*  `{chat.id}`\n"
+        f"📋  *Chat Type :*  `{chat.type}`\n\n"
+        f"👤  *Your ID :*  `{user.id}`\n"
+        f"👤  *Your Name :*  `{user.full_name}`\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━"
+    )
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+# ==========================================
+# CALLBACK HANDLER
 # ==========================================
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+
+    if query.from_user.id != ADMIN_ID:
+        await query.answer("❌ Access Denied!", show_alert=True)
+        return
+
     data = query.data
 
-    # --- Main Menu ---
-    if data == "back_main":
-        await query.edit_message_text(
-            "🤖 *Broadcast Bot*\n\nনিচের মেনু থেকে যা করতে চান বেছে নিন:",
-            parse_mode="Markdown",
-            reply_markup=main_menu_keyboard()
-        )
+    if data == "noop":
+        return
 
-    # --- Channel Menu ---
+    elif data == "back_main":
+        channels = len(get_channels())
+        groups = len(get_groups())
+        sources = len(get_sources())
+        text = (
+            "🤖  *B R O A D C A S T   B O T*\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"📺  *Channels :*  `{channels}`\n"
+            f"👥  *Groups :*  `{groups}`\n"
+            f"📡  *Sources :*  `{sources}`\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "👇  *Select an option below*"
+        )
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=main_menu_keyboard())
+
     elif data == "menu_channels":
         channels = get_channels()
-        count = len(channels)
-        await query.edit_message_text(
-            f"📺 *চ্যানেল ম্যানেজমেন্ট*\nমোট চ্যানেল: {count}টি\n\nচ্যানেল বেছে নিন বা নতুন যোগ করুন:",
-            parse_mode="Markdown",
-            reply_markup=channel_manage_keyboard()
+        text = (
+            "📺  *C H A N N E L   M A N A G E R*\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"🔢  *Total Channels :*  `{len(channels)}`\n\n"
+            "💡  Channel ID পেতে ওই channel-এ `/getid` পাঠাও\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━"
         )
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=channel_manage_keyboard())
 
     elif data == "ch_add":
         context.user_data['action'] = 'add_channel'
         await query.edit_message_text(
-            "📺 নতুন চ্যানেলের username লিখুন:\nউদাহরণ: @mychannel\n\nবাতিল করতে /cancel লিখুন",
+            "📺  *A D D   C H A N N E L*\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "Channel এর Chat ID টাইপ করো :\n\n"
+            "📌  Example :  `-1001234567890`\n\n"
+            "💡  ID পেতে channel-এ `/getid` দাও\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "❌  /cancel",
+            parse_mode="Markdown"
         )
 
     elif data.startswith("ch_del_"):
-        ch = data[7:]
-        remove_channel_db(ch)
+        chat_id = data[7:]
+        remove_channel_db(chat_id)
         channels = get_channels()
         await query.edit_message_text(
-            f"🗑️ *{ch}* মুছে ফেলা হয়েছে!\nবাকি চ্যানেল: {len(channels)}টি",
-            parse_mode="Markdown",
-            reply_markup=channel_manage_keyboard()
+            f"🗑  *Removed :*  `{chat_id}`\n🔢  *Remaining :*  `{len(channels)}`",
+            parse_mode="Markdown", reply_markup=channel_manage_keyboard()
         )
 
-    # --- Group Menu ---
     elif data == "menu_groups":
         groups = get_groups()
-        count = len(groups)
-        await query.edit_message_text(
-            f"👥 *গ্রুপ ম্যানেজমেন্ট*\nমোট গ্রুপ: {count}টি\n\nগ্রুপ বেছে নিন বা নতুন যোগ করুন:",
-            parse_mode="Markdown",
-            reply_markup=group_manage_keyboard()
+        text = (
+            "👥  *G R O U P   M A N A G E R*\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"🔢  *Total Groups :*  `{len(groups)}`\n\n"
+            "💡  Group ID পেতে ওই group-এ `/getid` পাঠাও\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━"
         )
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=group_manage_keyboard())
 
     elif data == "gr_add":
         context.user_data['action'] = 'add_group'
         await query.edit_message_text(
-            "👥 নতুন গ্রুপের username লিখুন:\nউদাহরণ: @mygroup\n\nবাতিল করতে /cancel লিখুন",
+            "👥  *A D D   G R O U P*\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "Group এর Chat ID টাইপ করো :\n\n"
+            "📌  Example :  `-1001234567890`\n\n"
+            "💡  Private group-এও কাজ করে!\n"
+            "ID পেতে group-এ `/getid` দাও\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "❌  /cancel",
+            parse_mode="Markdown"
         )
 
     elif data.startswith("gr_del_"):
-        gr = data[7:]
-        remove_group_db(gr)
+        chat_id = data[7:]
+        remove_group_db(chat_id)
         groups = get_groups()
         await query.edit_message_text(
-            f"🗑️ *{gr}* মুছে ফেলা হয়েছে!\nবাকি গ্রুপ: {len(groups)}টি",
-            parse_mode="Markdown",
-            reply_markup=group_manage_keyboard()
+            f"🗑  *Removed :*  `{chat_id}`\n🔢  *Remaining :*  `{len(groups)}`",
+            parse_mode="Markdown", reply_markup=group_manage_keyboard()
         )
 
-    # --- Source Menu ---
     elif data == "menu_sources":
         sources = get_sources()
-        text = "📡 *সোর্স চ্যানেল (অটো-ফরওয়ার্ড)*\n\n"
+        text = "📡  *S O U R C E   C H A N N E L S*\n━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         if sources:
-            text += "\n".join(f"• {s}" for s in sources)
+            for chat_id, title in sources:
+                label = title if title else chat_id
+                text += f"  ✅  `{label}` (`{chat_id}`)\n"
         else:
-            text += "কোনো সোর্স নেই।"
-        text += "\n\nনতুন যোগ করতে: /addsource @channelname"
-        await query.edit_message_text(text, parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 ফিরুন", callback_data="back_main")]]))
+            text += "  ❌  No source channels added yet.\n"
+        text += (
+            "\n━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "➕  To add :  `/addsource CHAT_ID`\n"
+            "🗑  To remove :  `/removesource CHAT_ID`"
+        )
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=back_keyboard())
 
-    # --- Post Menu ---
     elif data == "menu_post":
         await query.edit_message_text(
-            "📤 *কোথায় পোস্ট করবেন?*",
-            parse_mode="Markdown",
-            reply_markup=post_target_keyboard()
+            "📤  *B R O A D C A S T*\n━━━━━━━━━━━━━━━━━━━━━━━\n\n📌  কোথায় পাঠাবে?",
+            parse_mode="Markdown", reply_markup=post_target_keyboard()
         )
 
     elif data in ("post_channels", "post_groups", "post_all"):
         context.user_data['post_target'] = data
-        label = {"post_channels": "চ্যানেলে", "post_groups": "গ্রুপে", "post_all": "সব জায়গায়"}[data]
         context.user_data['action'] = 'post_message'
+        label_map = {
+            "post_channels": "📺  Channels Only",
+            "post_groups": "👥  Groups Only",
+            "post_all": "🌐  All"
+        }
         await query.edit_message_text(
-            f"✍️ *{label}* পোস্ট করতে মেসেজ লিখুন:\n(টেক্সট, ছবি, ভিডিও, ফাইল — সব পাঠাতে পারবেন)\n\nবাতিল করতে /cancel",
+            f"📤  *Target :*  {label_map[data]}\n\n✏️  Message টাইপ করো বা media পাঠাও\n\n❌  /cancel",
             parse_mode="Markdown"
         )
 
-    # --- Schedule Menu ---
     elif data == "menu_schedule":
         await query.edit_message_text(
-            "⏰ *শিডিউল পোস্ট*\n\nকমান্ড:\n`/schedule YYYY-MM-DD HH:MM আপনার মেসেজ`\n\nউদাহরণ:\n`/schedule 2025-08-01 09:00 সুপ্রভাত!`",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 ফিরুন", callback_data="back_main")]]))
-
-    # --- Help ---
-    elif data == "menu_help":
-        text = (
-            "📖 *সব কমান্ড:*\n\n"
-            "*/start* — মেনু দেখুন\n"
-            "*/addsource @name* — সোর্স চ্যানেল যোগ\n"
-            "*/addchannel @name* — টার্গেট চ্যানেল যোগ\n"
-            "*/addgroup @name* — গ্রুপ যোগ\n"
-            "*/post message* — সব চ্যানেল+গ্রুপে পোস্ট\n"
-            "*/postc message* — শুধু চ্যানেলে পোস্ট\n"
-            "*/postg message* — শুধু গ্রুপে পোস্ট\n"
-            "*/schedule DATE TIME msg* — শিডিউল পোস্ট\n"
+            "⏰  *S C H E D U L E   P O S T*\n━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "Format :\n`/schedule YYYY-MM-DD HH:MM message`\n\n"
+            "Example :\n`/schedule 2025-08-01 09:00 Good morning!`",
+            parse_mode="Markdown", reply_markup=back_keyboard()
         )
-        await query.edit_message_text(text, parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 ফিরুন", callback_data="back_main")]]))
+
+    elif data == "menu_admin":
+        await query.edit_message_text(
+            "🛡️  *A D M I N   P O W E R S*\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "🔇  Mute — কথা বলা বন্ধ\n"
+            "🔊  Unmute — কথা বলার অনুমতি ফিরে\n"
+            "🚫  Ban — গ্রুপ থেকে বের করে block\n"
+            "✅  Unban — Ban তুলে নেওয়া\n"
+            "👢  Kick — শুধু বের করে দেওয়া\n"
+            "📌  Pin — message পিন করা\n"
+            "🗑  Delete — message ডিলিট করা\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "⚠️  বটকে group-এ *Admin* করতে হবে!",
+            parse_mode="Markdown", reply_markup=admin_power_keyboard()
+        )
+
+    elif data in ("admin_mute", "admin_unmute", "admin_ban", "admin_unban",
+                  "admin_kick", "admin_pin", "admin_delete"):
+        action_map = {
+            "admin_mute": ("🔇  M U T E", "admin_mute"),
+            "admin_unmute": ("🔊  U N M U T E", "admin_unmute"),
+            "admin_ban": ("🚫  B A N", "admin_ban"),
+            "admin_unban": ("✅  U N B A N", "admin_unban"),
+            "admin_kick": ("👢  K I C K", "admin_kick"),
+            "admin_pin": ("📌  P I N   M S G", "admin_pin"),
+            "admin_delete": ("🗑  D E L E T E   M S G", "admin_delete"),
+        }
+        label, act = action_map[data]
+        context.user_data['action'] = act
+        await query.edit_message_text(
+            f"{label}\n━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "Format টাইপ করো :\n`CHAT_ID USER_ID`\n\n"
+            "📌  Example :\n`-1001234567890 987654321`\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━\n❌  /cancel",
+            parse_mode="Markdown"
+        )
+
+    elif data == "menu_help":
+        await query.edit_message_text(
+            "📖  *C O M M A N D   L I S T*\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "🔹  `/start`  —  Main menu\n"
+            "🔹  `/getid`  —  Chat ID দেখো\n\n"
+            "📺  *Channel :*\n"
+            "  `/addchannel CHAT_ID`\n"
+            "  `/removechannel CHAT_ID`\n\n"
+            "👥  *Group :*\n"
+            "  `/addgroup CHAT_ID`\n"
+            "  `/removegroup CHAT_ID`\n\n"
+            "📡  *Source :*\n"
+            "  `/addsource CHAT_ID`\n"
+            "  `/removesource CHAT_ID`\n\n"
+            "📤  *Broadcast :*\n"
+            "  `/post msg`  —  All\n"
+            "  `/postc msg`  —  Channels\n"
+            "  `/postg msg`  —  Groups\n\n"
+            "⏰  `/schedule DATE TIME msg`\n\n"
+            "🛡️  *Admin Powers :*\n"
+            "  `/mute CHAT_ID USER_ID`\n"
+            "  `/unmute CHAT_ID USER_ID`\n"
+            "  `/ban CHAT_ID USER_ID`\n"
+            "  `/unban CHAT_ID USER_ID`\n"
+            "  `/kick CHAT_ID USER_ID`\n"
+            "  `/pin CHAT_ID MSG_ID`\n"
+            "  `/delmsg CHAT_ID MSG_ID`\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━",
+            parse_mode="Markdown", reply_markup=back_keyboard()
+        )
 
 # ==========================================
-# 6. MESSAGE HANDLER (for add channel/group/post via button flow)
+# TEXT INPUT HANDLER
 # ==========================================
 async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+
     action = context.user_data.get('action')
 
     if action == 'add_channel':
-        username = update.message.text.strip()
-        if not username.startswith("@"):
-            username = "@" + username
-        if add_channel_db(username):
-            await update.message.reply_text(
-                f"✅ *{username}* চ্যানেল যোগ হয়েছে!",
-                parse_mode="Markdown",
-                reply_markup=main_menu_keyboard()
-            )
-        else:
-            await update.message.reply_text(
-                f"⚠️ *{username}* আগে থেকেই আছে।",
-                parse_mode="Markdown",
-                reply_markup=main_menu_keyboard()
-            )
+        raw = update.message.text.strip()
+        try:
+            chat_info = await context.bot.get_chat(raw)
+            title = chat_info.title or raw
+            chat_id = str(chat_info.id)
+            if add_channel_db(chat_id, title):
+                text = (
+                    "✅  *C H A N N E L   A D D E D*\n━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                    f"📺  *Title :*  `{title}`\n"
+                    f"🔢  *ID :*  `{chat_id}`\n"
+                    f"📊  *Total :*  `{len(get_channels())}`\n\n━━━━━━━━━━━━━━━━━━━━━━━"
+                )
+            else:
+                text = f"⚠️  `{chat_id}` already exists."
+        except Exception as e:
+            text = f"❌  *Error :*  `{e}`\n\nChat ID সঠিকভাবে দাও।"
         context.user_data['action'] = None
+        await update.message.reply_text(text, parse_mode="Markdown", reply_markup=main_menu_keyboard())
 
     elif action == 'add_group':
-        username = update.message.text.strip()
-        if not username.startswith("@"):
-            username = "@" + username
-        if add_group_db(username):
-            await update.message.reply_text(
-                f"✅ *{username}* গ্রুপ যোগ হয়েছে!",
-                parse_mode="Markdown",
-                reply_markup=main_menu_keyboard()
-            )
-        else:
-            await update.message.reply_text(
-                f"⚠️ *{username}* আগে থেকেই আছে।",
-                parse_mode="Markdown",
-                reply_markup=main_menu_keyboard()
-            )
+        raw = update.message.text.strip()
+        try:
+            chat_info = await context.bot.get_chat(raw)
+            title = chat_info.title or raw
+            chat_id = str(chat_info.id)
+            if add_group_db(chat_id, title):
+                text = (
+                    "✅  *G R O U P   A D D E D*\n━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                    f"👥  *Title :*  `{title}`\n"
+                    f"🔢  *ID :*  `{chat_id}`\n"
+                    f"📊  *Total :*  `{len(get_groups())}`\n\n━━━━━━━━━━━━━━━━━━━━━━━"
+                )
+            else:
+                text = f"⚠️  `{chat_id}` already exists."
+        except Exception as e:
+            text = f"❌  *Error :*  `{e}`\n\nChat ID সঠিকভাবে দাও।"
         context.user_data['action'] = None
+        await update.message.reply_text(text, parse_mode="Markdown", reply_markup=main_menu_keyboard())
 
     elif action == 'post_message':
         post_target = context.user_data.get('post_target', 'post_all')
         msg = update.message
         text = msg.text or msg.caption or ""
-        media_file_id = None
-        media_type = None
-
-        if msg.photo:
-            media_file_id = msg.photo[-1].file_id
-            media_type = "photo"
-        elif msg.video:
-            media_file_id = msg.video.file_id
-            media_type = "video"
-        elif msg.document:
-            media_file_id = msg.document.file_id
-            media_type = "document"
-        elif msg.audio:
-            media_file_id = msg.audio.file_id
-            media_type = "audio"
-        elif msg.animation:
-            media_file_id = msg.animation.file_id
-            media_type = "animation"
+        media_file_id, media_type = None, None
+        if msg.photo: media_file_id, media_type = msg.photo[-1].file_id, "photo"
+        elif msg.video: media_file_id, media_type = msg.video.file_id, "video"
+        elif msg.document: media_file_id, media_type = msg.document.file_id, "document"
+        elif msg.audio: media_file_id, media_type = msg.audio.file_id, "audio"
+        elif msg.animation: media_file_id, media_type = msg.animation.file_id, "animation"
 
         targets = []
-        if post_target in ("post_channels", "post_all"):
-            targets += get_channels()
-        if post_target in ("post_groups", "post_all"):
-            targets += get_groups()
+        if post_target in ("post_channels", "post_all"): targets += [r[0] for r in get_channels()]
+        if post_target in ("post_groups", "post_all"): targets += [r[0] for r in get_groups()]
 
         if not targets:
-            await update.message.reply_text("❌ কোনো টার্গেট নেই! আগে চ্যানেল/গ্রুপ যোগ করুন।",
-                reply_markup=main_menu_keyboard())
+            await update.message.reply_text("❌  No targets! Add channels/groups first.", reply_markup=main_menu_keyboard())
             context.user_data['action'] = None
             return
 
-        status = await update.message.reply_text(f"📤 {len(targets)}টি জায়গায় পাঠানো হচ্ছে...")
-        results = await broadcast(update.get_bot(), targets, text, media_file_id, media_type)
-        await status.edit_text(
-            f"✅ সফল: {results['success']}\n❌ ব্যর্থ: {results['fail']}",
-            reply_markup=main_menu_keyboard()
+        st = await update.message.reply_text(
+            f"📤  *SENDING...*\n🎯  Targets: `{len(targets)}`", parse_mode="Markdown"
+        )
+        results = await broadcast(context.bot, targets, text, media_file_id, media_type)
+        await st.edit_text(
+            f"📤  *DONE*\n✅  Success: `{results['success']}`\n❌  Failed: `{results['fail']}`",
+            parse_mode="Markdown", reply_markup=main_menu_keyboard()
         )
         context.user_data['action'] = None
 
+    elif action in ('admin_mute', 'admin_unmute', 'admin_ban', 'admin_unban',
+                    'admin_kick', 'admin_pin', 'admin_delete'):
+        parts = update.message.text.strip().split()
+        if len(parts) < 2:
+            await update.message.reply_text("❌  Format: `CHAT_ID USER_ID`", parse_mode="Markdown")
+            return
+        chat_id, target_id = parts[0], parts[1]
+        context.user_data['action'] = None
+        try:
+            if action == 'admin_mute':
+                await context.bot.restrict_chat_member(
+                    chat_id=chat_id, user_id=int(target_id),
+                    permissions=ChatPermissions(
+                        can_send_messages=False, can_send_media_messages=False,
+                        can_send_polls=False, can_send_other_messages=False
+                    )
+                )
+                resp = f"🔇  *MUTED*\n\n👤  `{target_id}` in `{chat_id}`"
+            elif action == 'admin_unmute':
+                await context.bot.restrict_chat_member(
+                    chat_id=chat_id, user_id=int(target_id),
+                    permissions=ChatPermissions(
+                        can_send_messages=True, can_send_media_messages=True,
+                        can_send_polls=True, can_send_other_messages=True,
+                        can_add_web_page_previews=True
+                    )
+                )
+                resp = f"🔊  *UNMUTED*\n\n👤  `{target_id}` in `{chat_id}`"
+            elif action == 'admin_ban':
+                await context.bot.ban_chat_member(chat_id=chat_id, user_id=int(target_id))
+                resp = f"🚫  *BANNED*\n\n👤  `{target_id}` from `{chat_id}`"
+            elif action == 'admin_unban':
+                await context.bot.unban_chat_member(chat_id=chat_id, user_id=int(target_id))
+                resp = f"✅  *UNBANNED*\n\n👤  `{target_id}` in `{chat_id}`"
+            elif action == 'admin_kick':
+                await context.bot.ban_chat_member(chat_id=chat_id, user_id=int(target_id))
+                await context.bot.unban_chat_member(chat_id=chat_id, user_id=int(target_id))
+                resp = f"👢  *KICKED*\n\n👤  `{target_id}` from `{chat_id}`"
+            elif action == 'admin_pin':
+                await context.bot.pin_chat_message(chat_id=chat_id, message_id=int(target_id))
+                resp = f"📌  *PINNED*\n\nMsg `{target_id}` in `{chat_id}`"
+            elif action == 'admin_delete':
+                await context.bot.delete_message(chat_id=chat_id, message_id=int(target_id))
+                resp = f"🗑  *DELETED*\n\nMsg `{target_id}` from `{chat_id}`"
+
+            await update.message.reply_text(
+                f"━━━━━━━━━━━━━━━━━━━━━━━\n{resp}\n━━━━━━━━━━━━━━━━━━━━━━━",
+                parse_mode="Markdown", reply_markup=admin_power_keyboard()
+            )
+        except TelegramError as e:
+            await update.message.reply_text(
+                f"❌  *ERROR :*  `{e}`\n\n⚠️  বটকে ওই group-এ Admin করা আছে?",
+                parse_mode="Markdown", reply_markup=admin_power_keyboard()
+            )
+
 # ==========================================
-# 7. COMMAND-BASED POST (Quick commands)
+# COMMAND HANDLERS
 # ==========================================
+@admin_only
+async def add_channel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Usage: /addchannel CHAT_ID")
+        return
+    try:
+        chat_info = await context.bot.get_chat(context.args[0])
+        title = chat_info.title or context.args[0]
+        chat_id = str(chat_info.id)
+        if add_channel_db(chat_id, title):
+            await update.message.reply_text(f"✅  Added: `{title}` (`{chat_id}`)", parse_mode="Markdown")
+        else:
+            await update.message.reply_text("⚠️  Already exists.")
+    except Exception as e:
+        await update.message.reply_text(f"❌  `{e}`", parse_mode="Markdown")
+
+@admin_only
+async def remove_channel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Usage: /removechannel CHAT_ID")
+        return
+    if remove_channel_db(context.args[0]):
+        await update.message.reply_text(f"🗑  Removed: `{context.args[0]}`", parse_mode="Markdown")
+    else:
+        await update.message.reply_text("❌  Not found.")
+
+@admin_only
+async def add_group_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Usage: /addgroup CHAT_ID")
+        return
+    try:
+        chat_info = await context.bot.get_chat(context.args[0])
+        title = chat_info.title or context.args[0]
+        chat_id = str(chat_info.id)
+        if add_group_db(chat_id, title):
+            await update.message.reply_text(f"✅  Added: `{title}` (`{chat_id}`)", parse_mode="Markdown")
+        else:
+            await update.message.reply_text("⚠️  Already exists.")
+    except Exception as e:
+        await update.message.reply_text(f"❌  `{e}`", parse_mode="Markdown")
+
+@admin_only
+async def remove_group_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Usage: /removegroup CHAT_ID")
+        return
+    if remove_group_db(context.args[0]):
+        await update.message.reply_text(f"🗑  Removed: `{context.args[0]}`", parse_mode="Markdown")
+    else:
+        await update.message.reply_text("❌  Not found.")
+
+@admin_only
+async def add_source_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Usage: /addsource CHAT_ID")
+        return
+    try:
+        chat_info = await context.bot.get_chat(context.args[0])
+        title = chat_info.title or context.args[0]
+        chat_id = str(chat_info.id)
+        if add_source_db(chat_id, title):
+            await update.message.reply_text(f"✅  Source Added: `{title}` (`{chat_id}`)", parse_mode="Markdown")
+        else:
+            await update.message.reply_text("⚠️  Already exists.")
+    except Exception as e:
+        await update.message.reply_text(f"❌  `{e}`", parse_mode="Markdown")
+
+@admin_only
+async def remove_source_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Usage: /removesource CHAT_ID")
+        return
+    conn = sqlite3.connect('channels.db')
+    c = conn.cursor()
+    c.execute("DELETE FROM source_channels WHERE chat_id=?", (context.args[0],))
+    affected = c.rowcount
+    conn.commit()
+    conn.close()
+    if affected:
+        await update.message.reply_text(f"🗑  Source Removed: `{context.args[0]}`", parse_mode="Markdown")
+    else:
+        await update.message.reply_text("❌  Not found.")
+
+@admin_only
+async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['action'] = None
+    await update.message.reply_text(
+        "❌  *CANCELLED*\n━━━━━━━━━━━━━━━━━━━━━━━",
+        parse_mode="Markdown", reply_markup=main_menu_keyboard()
+    )
+
+@admin_only
 async def post_all_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Send to all channels + groups"""
-    await _send_message(update, context, get_channels() + get_groups())
+    await _send_message(update, context, [r[0] for r in get_channels()] + [r[0] for r in get_groups()])
 
+@admin_only
 async def post_channels_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Send to channels only"""
-    await _send_message(update, context, get_channels())
+    await _send_message(update, context, [r[0] for r in get_channels()])
 
+@admin_only
 async def post_groups_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Send to groups only"""
-    await _send_message(update, context, get_groups())
+    await _send_message(update, context, [r[0] for r in get_groups()])
 
 async def _send_message(update, context, targets):
     if not targets:
-        await update.message.reply_text("❌ কোনো টার্গেট নেই!")
+        await update.message.reply_text("❌  No targets!")
         return
-
     text = " ".join(context.args) if context.args else ""
     media_file_id, media_type = None, None
-
     reply = update.message.reply_to_message
     if reply:
-        if reply.photo:
-            media_file_id, media_type = reply.photo[-1].file_id, "photo"
-        elif reply.video:
-            media_file_id, media_type = reply.video.file_id, "video"
-        elif reply.document:
-            media_file_id, media_type = reply.document.file_id, "document"
-        elif reply.audio:
-            media_file_id, media_type = reply.audio.file_id, "audio"
-        elif reply.animation:
-            media_file_id, media_type = reply.animation.file_id, "animation"
-        if not text and reply.caption:
-            text = reply.caption
-
+        if reply.photo: media_file_id, media_type = reply.photo[-1].file_id, "photo"
+        elif reply.video: media_file_id, media_type = reply.video.file_id, "video"
+        elif reply.document: media_file_id, media_type = reply.document.file_id, "document"
+        elif reply.audio: media_file_id, media_type = reply.audio.file_id, "audio"
+        elif reply.animation: media_file_id, media_type = reply.animation.file_id, "animation"
+        if not text and reply.caption: text = reply.caption
     if not text and not media_file_id:
-        await update.message.reply_text("মেসেজ লিখুন বা মিডিয়া reply করুন।")
+        await update.message.reply_text("Please provide message or reply to media.")
         return
-
-    await update.message.reply_text(f"📤 {len(targets)}টি জায়গায় পাঠানো হচ্ছে...")
+    st = await update.message.reply_text(f"📤  Sending... Targets: `{len(targets)}`", parse_mode="Markdown")
     results = await broadcast(context.bot, targets, text, media_file_id, media_type)
-    await update.message.reply_text(f"✅ সফল: {results['success']}\n❌ ব্যর্থ: {results['fail']}")
+    await st.edit_text(f"✅  Success: `{results['success']}`\n❌  Failed: `{results['fail']}`", parse_mode="Markdown")
 
 # ==========================================
-# 8. ADD COMMANDS
+# ADMIN POWER COMMANDS (direct)
 # ==========================================
-async def add_channel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Usage: /addchannel @name")
+async def _admin_action(update, context, action_name):
+    if not is_admin(update):
         return
-    ch = context.args[0] if context.args[0].startswith("@") else "@" + context.args[0]
-    if add_channel_db(ch):
-        await update.message.reply_text(f"✅ *{ch}* চ্যানেল যোগ হয়েছে!", parse_mode="Markdown")
-    else:
-        await update.message.reply_text(f"⚠️ আগে থেকেই আছে।")
-
-async def add_group_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Usage: /addgroup @name")
+    if len(context.args) < 2:
+        await update.message.reply_text(f"Usage: /{action_name} CHAT_ID USER_OR_MSG_ID")
         return
-    gr = context.args[0] if context.args[0].startswith("@") else "@" + context.args[0]
-    if add_group_db(gr):
-        await update.message.reply_text(f"✅ *{gr}* গ্রুপ যোগ হয়েছে!", parse_mode="Markdown")
-    else:
-        await update.message.reply_text(f"⚠️ আগে থেকেই আছে।")
+    chat_id, target_id = context.args[0], context.args[1]
+    try:
+        if action_name == 'mute':
+            await context.bot.restrict_chat_member(chat_id=chat_id, user_id=int(target_id),
+                permissions=ChatPermissions(can_send_messages=False, can_send_media_messages=False,
+                    can_send_polls=False, can_send_other_messages=False))
+            msg = f"🔇  Muted `{target_id}`"
+        elif action_name == 'unmute':
+            await context.bot.restrict_chat_member(chat_id=chat_id, user_id=int(target_id),
+                permissions=ChatPermissions(can_send_messages=True, can_send_media_messages=True,
+                    can_send_polls=True, can_send_other_messages=True, can_add_web_page_previews=True))
+            msg = f"🔊  Unmuted `{target_id}`"
+        elif action_name == 'ban':
+            await context.bot.ban_chat_member(chat_id=chat_id, user_id=int(target_id))
+            msg = f"🚫  Banned `{target_id}`"
+        elif action_name == 'unban':
+            await context.bot.unban_chat_member(chat_id=chat_id, user_id=int(target_id))
+            msg = f"✅  Unbanned `{target_id}`"
+        elif action_name == 'kick':
+            await context.bot.ban_chat_member(chat_id=chat_id, user_id=int(target_id))
+            await context.bot.unban_chat_member(chat_id=chat_id, user_id=int(target_id))
+            msg = f"👢  Kicked `{target_id}`"
+        elif action_name == 'pin':
+            await context.bot.pin_chat_message(chat_id=chat_id, message_id=int(target_id))
+            msg = f"📌  Pinned msg `{target_id}`"
+        elif action_name == 'delmsg':
+            await context.bot.delete_message(chat_id=chat_id, message_id=int(target_id))
+            msg = f"🗑  Deleted msg `{target_id}`"
+        await update.message.reply_text(msg, parse_mode="Markdown")
+    except TelegramError as e:
+        await update.message.reply_text(f"❌  `{e}`\n⚠️  বটকে Admin করা আছে?", parse_mode="Markdown")
 
-async def add_source_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Usage: /addsource @name")
-        return
-    ch = context.args[0] if context.args[0].startswith("@") else "@" + context.args[0]
-    if add_source_db(ch):
-        await update.message.reply_text(f"✅ *{ch}* সোর্স চ্যানেল যোগ হয়েছে!\nসব নতুন পোস্ট অটো ফরওয়ার্ড হবে।", parse_mode="Markdown")
-    else:
-        await update.message.reply_text(f"⚠️ আগে থেকেই আছে।")
-
-async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['action'] = None
-    await update.message.reply_text("❌ বাতিল করা হয়েছে।", reply_markup=main_menu_keyboard())
+async def mute_cmd(u, c): await _admin_action(u, c, 'mute')
+async def unmute_cmd(u, c): await _admin_action(u, c, 'unmute')
+async def ban_cmd(u, c): await _admin_action(u, c, 'ban')
+async def unban_cmd(u, c): await _admin_action(u, c, 'unban')
+async def kick_cmd(u, c): await _admin_action(u, c, 'kick')
+async def pin_cmd(u, c): await _admin_action(u, c, 'pin')
+async def delmsg_cmd(u, c): await _admin_action(u, c, 'delmsg')
 
 # ==========================================
-# 9. AUTO-FORWARD
+# AUTO-FORWARD
 # ==========================================
 async def auto_forward(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.channel_post:
         return
-    chat_username = f"@{update.channel_post.chat.username}" if update.channel_post.chat.username else None
-    if chat_username not in get_sources():
+    chat_id = str(update.channel_post.chat.id)
+    source_ids = [r[0] for r in get_sources()]
+    if chat_id not in source_ids:
         return
-
-    targets = get_channels() + get_groups()
+    targets = [r[0] for r in get_channels()] + [r[0] for r in get_groups()]
     if not targets:
         return
-
     msg = update.channel_post
     text = msg.text or msg.caption or ""
     media_file_id, media_type = None, None
-
-    if msg.photo:
-        media_file_id, media_type = msg.photo[-1].file_id, "photo"
-    elif msg.video:
-        media_file_id, media_type = msg.video.file_id, "video"
-    elif msg.document:
-        media_file_id, media_type = msg.document.file_id, "document"
-    elif msg.audio:
-        media_file_id, media_type = msg.audio.file_id, "audio"
-    elif msg.animation:
-        media_file_id, media_type = msg.animation.file_id, "animation"
-
+    if msg.photo: media_file_id, media_type = msg.photo[-1].file_id, "photo"
+    elif msg.video: media_file_id, media_type = msg.video.file_id, "video"
+    elif msg.document: media_file_id, media_type = msg.document.file_id, "document"
+    elif msg.audio: media_file_id, media_type = msg.audio.file_id, "audio"
+    elif msg.animation: media_file_id, media_type = msg.animation.file_id, "animation"
     results = await broadcast(context.bot, targets, text, media_file_id, media_type)
-    logger.info(f"Auto-forward from {chat_username}: ✅{results['success']} ❌{results['fail']}")
+    logger.info(f"Auto-forward from {chat_id}: {results}")
 
 # ==========================================
-# 10. SCHEDULE
+# SCHEDULE
 # ==========================================
+@admin_only
 async def schedule_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) < 3:
         await update.message.reply_text(
-            "Usage: /schedule YYYY-MM-DD HH:MM মেসেজ\nউদাহরণ: /schedule 2025-08-01 09:00 সুপ্রভাত!"
+            "Usage: `/schedule YYYY-MM-DD HH:MM message`", parse_mode="Markdown"
         )
         return
-    date_str, time_str = context.args[0], context.args[1]
+    schedule_time = f"{context.args[0]} {context.args[1]}"
     message = " ".join(context.args[2:])
-    schedule_time = f"{date_str} {time_str}"
     try:
         datetime.strptime(schedule_time, "%Y-%m-%d %H:%M")
     except ValueError:
-        await update.message.reply_text("❌ ভুল ফরম্যাট। YYYY-MM-DD HH:MM ব্যবহার করুন।")
+        await update.message.reply_text("❌  Format: `YYYY-MM-DD HH:MM`", parse_mode="Markdown")
         return
     add_scheduled_post(message, None, None, schedule_time)
-    await update.message.reply_text(
-        f"⏰ *শিডিউল হয়েছে!*\n📅 সময়: `{schedule_time}`\n💬 মেসেজ: {message}",
-        parse_mode="Markdown"
-    )
+    await update.message.reply_text(f"⏰  *SCHEDULED!*\n📅  `{schedule_time}`\n💬  {message}", parse_mode="Markdown")
 
 async def check_scheduled(context: ContextTypes.DEFAULT_TYPE):
     posts = get_pending_scheduled()
     for post in posts:
         post_id, message, media_file_id, media_type, target = post
         targets = []
-        if target in ("channels", "all"):
-            targets += get_channels()
-        if target in ("groups", "all"):
-            targets += get_groups()
-        if not targets:
-            targets = get_channels() + get_groups()
+        if target in ("channels", "all"): targets += [r[0] for r in get_channels()]
+        if target in ("groups", "all"): targets += [r[0] for r in get_groups()]
+        if not targets: targets = [r[0] for r in get_channels()] + [r[0] for r in get_groups()]
         await broadcast(context.bot, targets, message, media_file_id, media_type)
         mark_scheduled_sent(post_id)
-        logger.info(f"Scheduled post {post_id} sent.")
 
 # ==========================================
-# 11. MAIN
+# MAIN
 # ==========================================
 if __name__ == '__main__':
     init_db()
 
-    # ✅ এখানে আপনার BotFather টোকেন বসান
-    BOT_TOKEN = "8956561820:AAEBsYWuucvkhiUkq9SkWyg72ud17T53ATQ"
+    BOT_TOKEN = "8956561820:AAGdSxN1-rsvMn1acNtQkHGVMEusrMbcXUk"
 
     application = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # Commands
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("cancel", cancel_cmd))
+    application.add_handler(CommandHandler("getid", getid_cmd))
     application.add_handler(CommandHandler("addchannel", add_channel_cmd))
+    application.add_handler(CommandHandler("removechannel", remove_channel_cmd))
     application.add_handler(CommandHandler("addgroup", add_group_cmd))
+    application.add_handler(CommandHandler("removegroup", remove_group_cmd))
     application.add_handler(CommandHandler("addsource", add_source_cmd))
+    application.add_handler(CommandHandler("removesource", remove_source_cmd))
     application.add_handler(CommandHandler("post", post_all_cmd))
     application.add_handler(CommandHandler("postc", post_channels_cmd))
     application.add_handler(CommandHandler("postg", post_groups_cmd))
     application.add_handler(CommandHandler("schedule", schedule_cmd))
+    application.add_handler(CommandHandler("mute", mute_cmd))
+    application.add_handler(CommandHandler("unmute", unmute_cmd))
+    application.add_handler(CommandHandler("ban", ban_cmd))
+    application.add_handler(CommandHandler("unban", unban_cmd))
+    application.add_handler(CommandHandler("kick", kick_cmd))
+    application.add_handler(CommandHandler("pin", pin_cmd))
+    application.add_handler(CommandHandler("delmsg", delmsg_cmd))
 
-    # Button handler
     application.add_handler(CallbackQueryHandler(button_handler))
 
-    # Text/Media input handler (for button-flow add channel/group/post)
     application.add_handler(MessageHandler(
-        filters.TEXT & ~filters.COMMAND | filters.PHOTO | filters.VIDEO | filters.Document.ALL | filters.AUDIO | filters.ANIMATION,
+        (filters.TEXT & ~filters.COMMAND) | filters.PHOTO | filters.VIDEO |
+        filters.Document.ALL | filters.AUDIO | filters.ANIMATION,
         handle_text_input
     ))
 
-    # Auto-forward from source channel
     application.add_handler(MessageHandler(filters.ChatType.CHANNEL, auto_forward))
 
-    # Scheduled checker
     job_queue = application.job_queue
     if job_queue:
         job_queue.run_repeating(check_scheduled, interval=60, first=10)
     else:
-        logger.warning("JobQueue not available. Install: pip install 'python-telegram-bot[job-queue]'")
+        logger.warning("JobQueue missing. Run: pip install 'python-telegram-bot[job-queue]'")
 
-    print("🤖 Bot চালু হয়েছে!")
-    print("✅ বাটন মেনু | ✅ চ্যানেল+গ্রুপ | ✅ অটো-ফরওয়ার্ড | ✅ শিডিউল")
+    print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    print("  🤖  B R O A D C A S T   B O T")
+    print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    print(f"  👑  Admin: {ADMIN_ID}")
+    print("  ✅  Private Group Support (Chat ID)")
+    print("  ✅  Admin Powers (mute/ban/kick)")
+    print("  ✅  Auto-Forward | Scheduler")
+    print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     application.run_polling()
