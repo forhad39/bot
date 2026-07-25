@@ -18,7 +18,7 @@ from telegram.ext import (
 )
 
 # -----------------------
-# Configuration (Set directly)
+# Configuration
 # -----------------------
 BOT_TOKEN = "8956561820:AAEBsYWuucvkhiUkq9SkWyg72ud17T53ATQ"
 API_KEY = "supersecretapikey"
@@ -211,13 +211,13 @@ def start_api_in_thread(host="0.0.0.0", port=8000):
     t.start()
 
 # -----------------------
-# Main
+# Main Execution (Python 3.12 Compatible)
 # -----------------------
-def main():
+async def start_bot_and_db():
     global application
     
-    # initialize DB
-    asyncio.run(init_db())
+    # Initialize DB inside the active loop
+    await init_db()
 
     application = ApplicationBuilder().token(BOT_TOKEN).build()
 
@@ -232,9 +232,16 @@ def main():
     start_api_in_thread(host="0.0.0.0", port=8000)
     print("API server started at http://0.0.0.0:8000 (use X-API-KEY header)")
 
-    # Run the bot
+    # Initialize and start polling
     print("Starting Telegram bot...")
-    application.run_polling()
+    async with application:
+        await application.start()
+        await application.updater.start_polling()
+        # Keep the bot running
+        await asyncio.Event().wait()
 
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(start_bot_and_db())
+    except (KeyboardInterrupt, SystemExit):
+        print("\nBot stopped!")
