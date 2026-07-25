@@ -14,7 +14,7 @@ from telegram.ext import (
     ApplicationBuilder,
     ContextTypes,
     CommandHandler,
-    MyChatMemberHandler,
+    ChatMemberHandler,
 )
 
 # -----------------------
@@ -224,7 +224,9 @@ def main():
     # Register handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("post", post_to_all_command))
-    application.add_handler(MyChatMemberHandler(my_chat_member))
+    application.add_handler(
+        ChatMemberHandler(my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER)
+    )
 
     # Start API server in background thread
     start_api_in_thread(host="0.0.0.0", port=8000)
